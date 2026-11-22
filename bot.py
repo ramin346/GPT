@@ -7,6 +7,7 @@ import re
 import time
 
 import aiosqlite
+import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -33,6 +34,8 @@ SUPPORT = os.environ.get("SUPPORT", "@your_support")
 DB_PATH = os.environ.get("DB_PATH", "shop.db")
 LOW_STOCK = int(os.environ.get("LOW_STOCK", "3"))  # هشدار به ادمین وقتی موجودی کمتر یا مساوی این عدد شد
 AUTO_UPDATE_MINUTES = int(os.environ.get("AUTO_UPDATE_MINUTES", "10"))  # 0 = خاموش
+# برای تست با sandbox: https://api-sandbox.nowpayments.io/v1
+NP_API_BASE = os.environ.get("NOWPAYMENTS_API_BASE", "https://api.nowpayments.io/v1").rstrip("/")
 
 router = Router()  # کاربران
 admin = Router()  # فقط ادمین‌ها
@@ -69,8 +72,15 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS topups(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
             status TEXT, created INTEGER);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
         """
     )
+    cols = {r["name"] for r in await qa("PRAGMA table_info(topups)")}
+    for col, decl in [("gateway", "TEXT DEFAULT 'card'"), ("usdt", "REAL"), ("payment_id", "TEXT"),
+                      ("pay_address", "TEXT"), ("pay_amount", "TEXT"), ("pay_currency", "TEXT"),
+                      ("np_status", "TEXT")]:
+        if col not in cols:
+            await db.execute(f"ALTER TABLE topups ADD COLUMN {col} {decl}")
     await db.commit()
 
 
@@ -112,6 +122,46 @@ async def stock_count(pid: int) -> int:
     return row["n"]
 
 
+# ───────────────────────── تنظیمات داخل ربات ─────────────────────────
+async def get_setting(key: str, default: str = "") -> str:
+    row = await q1("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row and row["value"] is not None else default
+
+
+async def set_setting(key: str, value: str):
+    await ex("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, value))
+
+
+async def get_float(key: str, default: float = 0.0) -> float:
+    try:
+        return float(await get_setting(key, str(default)))
+    except ValueError:
+        return default
+
+
+# ───────────────────────── NOWPayments ─────────────────────────
+class NPError(Exception):
+    pass
+
+
+async def np_request(method: str, path: str, **kw):
+    key = await get_setting("np_api_key", "")
+    if not key:
+        raise NPError("API Key تنظیم نشده است.")
+    try:
+        async with httpx.AsyncClient(timeout=25) as cl:
+            r = await cl.request(method, f"{NP_API_BASE}{path}", headers={"x-api-key": key}, **kw)
+    except httpx.HTTPError as e:
+        raise NPError(f"خطای شبکه: {e.__class__.__name__}") from e
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text[:300]}
+    if r.status_code >= 300:
+        raise NPError(f"HTTP {r.status_code}: {str(data)[:300]}")
+    return data
+
+
 # ───────────────────────── ابزارهای کمکی ─────────────────────────
 _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
 
@@ -119,6 +169,15 @@ _DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890
 def parse_int(text: str | None) -> int | None:
     t = (text or "").translate(_DIGITS).replace(",", "").replace("،", "").strip()
     return int(t) if t.isdigit() else None
+
+
+def parse_float(text: str | None) -> float | None:
+    t = (text or "").translate(_DIGITS).replace(",", "").replace("٫", ".").replace("/", ".").strip()
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return v if v == v and v != float("inf") else None
 
 
 def fmt(n: int) -> str:
@@ -379,36 +438,82 @@ async def order_view(c: CallbackQuery):
 
 
 # ───────────────────────── شارژ حساب ─────────────────────────
+NETWORKS = {"usdttrc20": "TRC20", "usdtbsc": "BEP20", "usdterc20": "ERC20"}
+
+
 class TopUp(StatesGroup):
-    amount = State()
+    amount = State()   # کارت‌به‌کارت (مبلغ به تومان)
     receipt = State()
+    usdt = State()     # تتر (مبلغ به USDT)
+
+
+async def gateways_enabled() -> list[str]:
+    gws = []
+    if await get_setting("card_enabled", "1") == "1" and await get_setting("card_number", CARD_NUMBER):
+        gws.append("card")
+    if await get_setting("np_enabled", "0") == "1" and await get_setting("np_api_key", ""):
+        gws.append("np")
+    return gws
+
+
+async def begin_gateway(c: CallbackQuery, state: FSMContext, gw: str):
+    if gw == "card":
+        await state.set_state(TopUp.amount)
+        await edit(c, f"مبلغ شارژ را به {CURRENCY} (فقط عدد) بفرست:", BACK_HOME)
+    else:
+        rate = await get_float("usdt_rate", 0)
+        min_u = await get_float("usdt_min", 1)
+        await state.set_state(TopUp.usdt)
+        await edit(
+            c, f"💎 شارژ با تتر (USDT)\n\nنرخ: هر ۱ تتر = {fmt(int(rate))} {CURRENCY}\n"
+               f"حداقل شارژ: {min_u:g} تتر\n\nمبلغ را به تتر بفرست (مثلاً 10 یا 12.5):", BACK_HOME)
 
 
 @router.callback_query(F.data == "topup")
 async def topup(c: CallbackQuery, state: FSMContext):
-    await state.set_state(TopUp.amount)
-    await edit(c, f"مبلغ شارژ را به {CURRENCY} (فقط عدد) بفرست:", BACK_HOME)
+    await state.clear()
+    gws = await gateways_enabled()
+    if not gws:
+        await edit(c, "فعلاً درگاه پرداختی فعال نیست. با پشتیبانی تماس بگیر.", BACK_HOME)
+    elif len(gws) == 1:
+        await begin_gateway(c, state, gws[0])
+    else:
+        await edit(c, "روش پرداخت را انتخاب کن:",
+                   kb([("💳 کارت‌به‌کارت", "gw:card")], [("💎 تتر (USDT)", "gw:np")], [("🔙 بازگشت", "home")]))
     await c.answer()
 
 
+@router.callback_query(F.data.startswith("gw:"))
+async def choose_gateway(c: CallbackQuery, state: FSMContext):
+    gw = c.data.split(":")[1]
+    if gw not in await gateways_enabled():
+        await c.answer("این درگاه فعال نیست.", show_alert=True)
+        return
+    await begin_gateway(c, state, gw)
+    await c.answer()
+
+
+# ── کارت‌به‌کارت ──
 @router.message(TopUp.amount)
 async def topup_amount(m: Message, state: FSMContext):
     amount = parse_int(m.text)
     if not amount or amount <= 0:
         await m.answer("لطفاً فقط عدد معتبر بفرست.")
         return
+    card = await get_setting("card_number", CARD_NUMBER)
+    owner = await get_setting("card_owner", CARD_OWNER)
     await state.update_data(amount=amount)
     await state.set_state(TopUp.receipt)
     await m.answer(
         f"مبلغ {fmt(amount)} {CURRENCY} را به کارت زیر واریز کن و عکس رسید را بفرست:\n\n"
-        f"💳 {CARD_NUMBER}\n👤 {CARD_OWNER}", reply_markup=BACK_HOME)
+        f"💳 {card}\n👤 {owner}", reply_markup=BACK_HOME)
 
 
 @router.message(TopUp.receipt, F.photo)
 async def topup_receipt(m: Message, state: FSMContext, bot: Bot):
     amount = (await state.get_data())["amount"]
     await ensure_user(m.from_user.id, m.from_user.username)
-    cur = await ex("INSERT INTO topups(user_id, amount, status, created) VALUES(?,?,'pending',?)",
+    cur = await ex("INSERT INTO topups(user_id, amount, status, created, gateway) VALUES(?,?,'pending',?,'card')",
                    (m.from_user.id, amount, int(time.time())))
     tid = cur.lastrowid
     markup = kb([("✅ تأیید", f"ta:{tid}"), ("❌ رد", f"tr:{tid}")])
@@ -416,7 +521,7 @@ async def topup_receipt(m: Message, state: FSMContext, bot: Bot):
         try:
             await bot.send_photo(
                 a, m.photo[-1].file_id,
-                caption=(f"درخواست شارژ #{tid}\nکاربر: {m.from_user.id} (@{m.from_user.username})\n"
+                caption=(f"درخواست شارژ #{tid} (کارت‌به‌کارت)\nکاربر: {m.from_user.id} (@{m.from_user.username})\n"
                          f"مبلغ: {fmt(amount)} {CURRENCY}"),
                 reply_markup=markup)
         except Exception:
@@ -430,8 +535,152 @@ async def topup_need_photo(m: Message):
     await m.answer("لطفاً عکس رسید را بفرست.")
 
 
+# ── تتر (NOWPayments) ──
+async def finalize_topup(tid: int) -> bool:
+    """شارژ را فقط یک‌بار و اتمیک نهایی می‌کند (برای کارت و تتر)."""
+    t = await q1("SELECT user_id, amount FROM topups WHERE id=?", (tid,))
+    if not t:
+        return False
+    await ensure_user(t["user_id"], None)
+    cur = await db.execute("UPDATE topups SET status='approved' WHERE id=? AND status='pending'", (tid,))
+    if cur.rowcount != 1:
+        await db.rollback()
+        return False
+    await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (t["amount"], t["user_id"]))
+    await db.commit()
+    return True
+
+
+@router.message(TopUp.usdt)
+async def topup_usdt(m: Message, state: FSMContext, bot: Bot):
+    amount = parse_float(m.text)
+    min_u = await get_float("usdt_min", 1)
+    rate = await get_float("usdt_rate", 0)
+    if amount is None or amount < min_u:
+        await m.answer(f"مبلغ معتبر بفرست (حداقل {min_u:g} تتر).")
+        return
+    if "np" not in await gateways_enabled() or rate <= 0:
+        await state.clear()
+        await m.answer("این درگاه فعلاً فعال نیست.", reply_markup=main_menu(m.from_user.id))
+        return
+    coin = await get_setting("np_coin", "usdttrc20")
+    await m.answer("⏳ در حال ساخت آدرس پرداخت...")
+    try:
+        d = await np_request("POST", "/payment", json={
+            "price_amount": round(amount, 2), "price_currency": "usd", "pay_currency": coin,
+            "order_id": f"u{m.from_user.id}-{int(time.time())}",
+            "order_description": "wallet topup"})
+        payment_id = str(d["payment_id"])
+        address = d["pay_address"]
+        pay_amount = d["pay_amount"]
+    except (NPError, KeyError, TypeError) as e:
+        logging.error("NOWPayments create payment failed: %s", e)
+        await m.answer("❌ ساخت پرداخت ناموفق بود. چند لحظه بعد دوباره تلاش کن یا با پشتیبانی تماس بگیر.")
+        await notify_admins(bot, f"⚠️ خطا در ساخت پرداخت NOWPayments:\n{str(e)[:400]}")
+        return
+    credit_amount = int(round(amount * rate))
+    await ensure_user(m.from_user.id, m.from_user.username)
+    cur = await ex(
+        "INSERT INTO topups(user_id, amount, status, created, gateway, usdt, payment_id, pay_address,"
+        " pay_amount, pay_currency, np_status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (m.from_user.id, credit_amount, "pending", int(time.time()), "nowpayments", amount, payment_id,
+         address, str(pay_amount), coin, str(d.get("payment_status", "waiting"))))
+    tid = cur.lastrowid
+    await state.clear()
+    await m.answer(
+        f"💎 پرداخت تتر (سفارش #{tid})\n\n"
+        f"💵 مبلغ دقیق: <code>{html.escape(str(pay_amount))}</code> USDT\n"
+        f"🌐 شبکه: {NETWORKS.get(coin, coin)}\n"
+        f"📮 آدرس:\n<code>{html.escape(address)}</code>\n\n"
+        f"⚠️ دقیقاً همین مقدار را روی همین شبکه بفرست. مبلغ یا شبکه‌ی اشتباه ممکن است باعث از دست رفتن پول شود.\n\n"
+        f"بعد از تأیید شبکه، {fmt(credit_amount)} {CURRENCY} به کیف پولت اضافه می‌شود (بررسی خودکار؛ "
+        f"با دکمه‌ی زیر هم می‌توانی همین حالا بررسی کنی).",
+        parse_mode="HTML",
+        reply_markup=kb([("🔄 بررسی پرداخت", f"npcheck:{tid}")], [("🔙 بازگشت", "home")]))
+
+
+async def process_np_topup(bot: Bot, t) -> str:
+    """وضعیت پرداخت را از NOWPayments می‌گیرد و در صورت تکمیل، حساب را شارژ می‌کند."""
+    try:
+        d = await np_request("GET", f"/payment/{t['payment_id']}")
+    except NPError as e:
+        logging.warning("NOWPayments status check failed (topup %s): %s", t["id"], e)
+        return "error"
+    st = str(d.get("payment_status", ""))
+    if st and st != t["np_status"]:
+        await ex("UPDATE topups SET np_status=? WHERE id=?", (st, t["id"]))
+    if st == "finished":
+        if await finalize_topup(t["id"]):
+            try:
+                await bot.send_message(
+                    t["user_id"], f"✅ پرداخت تتر تأیید شد و {fmt(t['amount'])} {CURRENCY} به کیف پولت اضافه شد.")
+            except Exception:
+                pass
+            await notify_admins(bot, f"💎 شارژ تتر #{t['id']} انجام شد: {t['usdt']:g} USDT ← "
+                                     f"{fmt(t['amount'])} {CURRENCY} (کاربر {t['user_id']})")
+    elif st in ("failed", "expired", "refunded"):
+        cur = await ex("UPDATE topups SET status=? WHERE id=? AND status='pending'", (st, t["id"]))
+        if cur.rowcount == 1:
+            try:
+                await bot.send_message(t["user_id"], f"❌ پرداخت تتر سفارش #{t['id']} ناموفق یا منقضی شد. "
+                                                     "اگر مبلغی ارسال کرده‌ای با پشتیبانی تماس بگیر.")
+            except Exception:
+                pass
+    elif st == "partially_paid" and t["np_status"] != "partially_paid":
+        await notify_admins(
+            bot, f"⚠️ پرداخت ناقص در شارژ تتر #{t['id']} (کاربر {t['user_id']}).\n"
+                 f"payment_id: {t['payment_id']}\nارسال‌شده: {d.get('actually_paid')} از {t['pay_amount']}\n"
+                 "بررسی و شارژ دستی لازم است.")
+    return st
+
+
+@router.callback_query(F.data.startswith("npcheck:"))
+async def np_check(c: CallbackQuery, bot: Bot):
+    t = await q1("SELECT * FROM topups WHERE id=? AND user_id=? AND gateway='nowpayments'",
+                 (int(c.data.split(":")[1]), c.from_user.id))
+    if not t:
+        await c.answer("پرداخت پیدا نشد.", show_alert=True)
+        return
+    if t["status"] == "approved":
+        await c.answer("✅ این پرداخت قبلاً تأیید و حسابت شارژ شده.", show_alert=True)
+        return
+    if t["status"] != "pending":
+        await c.answer("این پرداخت ناموفق یا منقضی شده است.", show_alert=True)
+        return
+    st = await process_np_topup(bot, t)
+    msgs = {
+        "finished": "✅ پرداخت تأیید شد و حسابت شارژ شد.",
+        "waiting": "هنوز پرداختی دریافت نشده. بعد از ارسال، چند دقیقه صبر کن.",
+        "confirming": "پرداخت دیده شد؛ منتظر تأیید شبکه هستیم.",
+        "confirmed": "پرداخت تأیید شد؛ در حال نهایی‌سازی.",
+        "sending": "پرداخت تأیید شد؛ در حال نهایی‌سازی.",
+        "partially_paid": "مبلغ ناقص ارسال شده؛ با پشتیبانی تماس بگیر.",
+        "failed": "پرداخت ناموفق بود.",
+        "expired": "پرداخت منقضی شد.",
+        "refunded": "پرداخت برگشت خورد.",
+        "error": "خطا در بررسی. چند لحظه بعد دوباره تلاش کن.",
+    }
+    await c.answer(msgs.get(st, f"وضعیت: {st}"), show_alert=True)
+
+
+async def np_poll_loop(bot: Bot):
+    """هر ۶۰ ثانیه پرداخت‌های تتر در انتظار را بررسی می‌کند (بدون نیاز به وب‌هوک)."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            rows = await qa(
+                "SELECT * FROM topups WHERE gateway='nowpayments' AND status='pending' AND created>?",
+                (int(time.time()) - 3 * 86400,))
+            for t in rows:
+                await process_np_topup(bot, t)
+                await asyncio.sleep(1)
+        except Exception:
+            logging.exception("np poll loop error")
+        await asyncio.sleep(60)
+
+
 # کاربر عادی که دکمه‌های ادمین را بزند
-@router.callback_query(F.data.startswith(("admin", "adm_", "acat", "aprod", "astock", "aedit", "ta:", "tr:")))
+@router.callback_query(F.data.startswith(("admin", "adm_", "acat", "aprod", "astock", "aedit", "agw", "aset", "ta:", "tr:")))
 async def not_admin(c: CallbackQuery):
     await c.answer("دسترسی نداری.", show_alert=True)
 
@@ -447,6 +696,7 @@ class Flow(StatesGroup):
     add_stock = State()
     edit_value = State()
     manual = State()
+    set_value = State()
 
 
 @admin.callback_query(F.data == "admin")
@@ -455,7 +705,8 @@ async def admin_panel(c: CallbackQuery, state: FSMContext):
     await edit(
         c, f"⚙️ پنل ادمین\nنسخه: {updater.current_version()}",
         kb([("📂 دسته‌ها و محصولات", "adm_cats")],
-           [("📊 آمار", "adm_stats"), ("💳 شارژ دستی کاربر", "adm_manual")],
+           [("💳 درگاه‌های پرداخت", "adm_gw")],
+           [("📊 آمار", "adm_stats"), ("💰 شارژ دستی کاربر", "adm_manual")],
            [("⬆️ آپدیت ربات از گیت‌هاب", "adm_update")],
            [("🔙 بازگشت", "home")]))
     await c.answer()
@@ -812,15 +1063,16 @@ async def adm_manual_do(m: Message, state: FSMContext):
 async def topup_decide(c: CallbackQuery, bot: Bot):
     action, tid = c.data.split(":")
     t = await q1("SELECT * FROM topups WHERE id=?", (int(tid),))
-    if not t or t["status"] != "pending":
+    if not t or t["status"] != "pending" or t["gateway"] == "nowpayments":
         await c.answer("این درخواست قبلاً بررسی شده.", show_alert=True)
         return
     if action == "ta":
-        await credit(t["user_id"], t["amount"])
-        await ex("UPDATE topups SET status='approved' WHERE id=?", (t["id"],))
+        if not await finalize_topup(t["id"]):
+            await c.answer("این درخواست قبلاً بررسی شده.", show_alert=True)
+            return
         msg, note = f"✅ شارژ {fmt(t['amount'])} {CURRENCY} تأیید شد.", "تأیید شد ✅"
     else:
-        await ex("UPDATE topups SET status='rejected' WHERE id=?", (t["id"],))
+        await ex("UPDATE topups SET status='rejected' WHERE id=? AND status='pending'", (t["id"],))
         msg, note = "❌ درخواست شارژ رد شد. با پشتیبانی تماس بگیر.", "رد شد ❌"
     try:
         await bot.send_message(t["user_id"], msg)
@@ -828,6 +1080,148 @@ async def topup_decide(c: CallbackQuery, bot: Bot):
         pass
     await c.message.edit_caption(caption=(c.message.caption or "") + f"\n\n{note}")
     await c.answer()
+
+
+# ── درگاه‌های پرداخت ──
+SETTING_PROMPTS = {
+    "card_number": "شماره کارت جدید را بفرست:",
+    "card_owner": "نام صاحب کارت را بفرست:",
+    "np_api_key": "API Key پنل NOWPayments را بفرست (پیامت بعد از دریافت خودکار پاک می‌شود):",
+    "usdt_rate": f"نرخ هر ۱ تتر را به {CURRENCY} بفرست (مثلاً 65000):",
+    "usdt_min": "حداقل مبلغ شارژ را به تتر بفرست (مثلاً 5):",
+}
+
+
+def mask_key(k: str) -> str:
+    if not k:
+        return "—"
+    return f"{k[:4]}…{k[-4:]}" if len(k) > 10 else "••••"
+
+
+async def gw_panel():
+    card_on = await get_setting("card_enabled", "1") == "1"
+    np_on = await get_setting("np_enabled", "0") == "1"
+    card = await get_setting("card_number", CARD_NUMBER) or "—"
+    owner = await get_setting("card_owner", CARD_OWNER) or "—"
+    key = await get_setting("np_api_key", "")
+    coin = await get_setting("np_coin", "usdttrc20")
+    rate = await get_float("usdt_rate", 0)
+    min_u = await get_float("usdt_min", 1)
+    on, off = "🟢 روشن", "🔴 خاموش"
+    text = (
+        "💳 درگاه‌های پرداخت\n\n"
+        f"1️⃣ کارت‌به‌کارت: {on if card_on else off}\n"
+        f"   شماره کارت: {card}\n   صاحب کارت: {owner}\n\n"
+        f"2️⃣ تتر (NOWPayments): {on if np_on else off}\n"
+        f"   API Key: {mask_key(key)}\n   شبکه: {NETWORKS.get(coin, coin)}\n"
+        f"   نرخ: هر ۱ تتر = {fmt(int(rate)) if rate else 'تنظیم نشده'} {CURRENCY}\n"
+        f"   حداقل شارژ: {min_u:g} تتر")
+    nets = [(("✅ " if coin == c else "") + n, f"agw_net:{c}") for c, n in NETWORKS.items()]
+    markup = kb(
+        [(("🔴 خاموش‌کردن" if card_on else "🟢 روشن‌کردن") + " کارت‌به‌کارت", "agw_toggle:card")],
+        [("✏️ شماره کارت", "aset:card_number"), ("✏️ نام صاحب کارت", "aset:card_owner")],
+        [(("🔴 خاموش‌کردن" if np_on else "🟢 روشن‌کردن") + " تتر", "agw_toggle:np")],
+        [("🔑 API Key", "aset:np_api_key"), ("💱 نرخ تتر", "aset:usdt_rate")],
+        [("⬇️ حداقل شارژ", "aset:usdt_min"), ("🧪 تست اتصال", "agw_test")],
+        nets,
+        [("🔙 بازگشت", "admin")],
+    )
+    return text, markup
+
+
+@admin.callback_query(F.data == "adm_gw")
+async def adm_gw(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = await gw_panel()
+    await edit(c, text, markup)
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("agw_toggle:"))
+async def agw_toggle(c: CallbackQuery):
+    g = c.data.split(":")[1]
+    if g == "card":
+        on = await get_setting("card_enabled", "1") == "1"
+        if not on and not await get_setting("card_number", CARD_NUMBER):
+            await c.answer("اول شماره کارت را تنظیم کن.", show_alert=True)
+            return
+        await set_setting("card_enabled", "0" if on else "1")
+    else:
+        on = await get_setting("np_enabled", "0") == "1"
+        if not on:
+            if not await get_setting("np_api_key", ""):
+                await c.answer("اول API Key را تنظیم کن.", show_alert=True)
+                return
+            if await get_float("usdt_rate", 0) <= 0:
+                await c.answer("اول نرخ تتر را تنظیم کن.", show_alert=True)
+                return
+        await set_setting("np_enabled", "0" if on else "1")
+    text, markup = await gw_panel()
+    await edit(c, text, markup)
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("agw_net:"))
+async def agw_net(c: CallbackQuery):
+    coin = c.data.split(":")[1]
+    if coin in NETWORKS:
+        await set_setting("np_coin", coin)
+    text, markup = await gw_panel()
+    await edit(c, text, markup)
+    await c.answer()
+
+
+@admin.callback_query(F.data == "agw_test")
+async def agw_test(c: CallbackQuery):
+    coin = await get_setting("np_coin", "usdttrc20")
+    try:
+        d = await np_request("GET", "/min-amount", params={"currency_from": coin, "currency_to": coin})
+        await c.answer(f"✅ اتصال برقرار است. حداقل مبلغ شبکه: {d.get('min_amount')} (حداقل شارژ ربات را بالاتر از این بگذار)",
+                       show_alert=True)
+    except NPError as e:
+        await c.answer(f"❌ {str(e)[:180]}", show_alert=True)
+
+
+@admin.callback_query(F.data.startswith("aset:"))
+async def aset(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[1]
+    if key not in SETTING_PROMPTS:
+        await c.answer()
+        return
+    await state.set_state(Flow.set_value)
+    await state.update_data(key=key)
+    await edit(c, SETTING_PROMPTS[key], kb([("🔙 انصراف", "adm_gw")]))
+    await c.answer()
+
+
+@admin.message(Flow.set_value)
+async def set_value(m: Message, state: FSMContext):
+    key = (await state.get_data())["key"]
+    raw = (m.text or "").strip()
+    if key == "np_api_key":
+        try:
+            await m.delete()  # پیام حاوی کلید را پاک کن
+        except Exception:
+            pass
+    if not raw:
+        await m.answer("مقدار معتبر بفرست.")
+        return
+    if key == "usdt_rate":
+        v = parse_float(raw)
+        if not v or v <= 0:
+            await m.answer("یک عدد مثبت بفرست.")
+            return
+        raw = str(v)
+    elif key == "usdt_min":
+        v = parse_float(raw)
+        if not v or v <= 0:
+            await m.answer("یک عدد مثبت بفرست.")
+            return
+        raw = str(v)
+    await set_setting(key, raw)
+    await state.clear()
+    text, markup = await gw_panel()
+    await m.answer("✅ ذخیره شد.\n\n" + text, reply_markup=markup)
 
 
 # ───────────────────────── آپدیت خودکار از گیت‌هاب ─────────────────────────
@@ -899,6 +1293,7 @@ async def main():
     dp.include_router(admin)
     dp.include_router(router)
     bg = asyncio.create_task(auto_update_loop(bot))  # noqa: F841
+    bg2 = asyncio.create_task(np_poll_loop(bot))  # noqa: F841
     await dp.start_polling(bot)
 
 
