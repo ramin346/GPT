@@ -10,7 +10,7 @@ from uuid import uuid4
 import aiosqlite
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -407,7 +407,8 @@ async def do_purchase(uid: int, pid: int) -> tuple[str, dict | None]:
             logging.exception("purchase failed")
             return "error", None
         remaining = await stock_count(pid)
-        return "ok", {"order_id": oid, "name": p["name"], "content": item["content"], "remaining": remaining}
+        return "ok", {"order_id": oid, "name": p["name"], "price": p["price"],
+                      "content": item["content"], "remaining": remaining}
 
 
 def delivery_text(order_id: int, name: str, content: str) -> str:
@@ -426,9 +427,18 @@ async def pay(c: CallbackQuery, bot: Bot):
         pid = int(c.data.split(":")[1])
         status, info = await do_purchase(uid, pid)
         if status == "ok":
-            await edit(c, delivery_text(info["order_id"], info["name"], info["content"]),
-                       BACK_HOME, parse_mode="HTML")
-            await c.answer()
+            try:
+                await edit(c, delivery_text(info["order_id"], info["name"], info["content"]),
+                           BACK_HOME, parse_mode="HTML")
+                await c.answer()
+            finally:
+                username = f"@{c.from_user.username}" if c.from_user.username else "بدون نام کاربری"
+                order_id = info["order_id"]
+                await notify_admins(
+                    bot, f"🛒 خرید موفق | سفارش #{order_id}\n"
+                         f"خریدار: {username}\nآیدی عددی: {uid}\n"
+                         f"محصول: {info['name']}\nمبلغ: {fmt(info['price'])} {CURRENCY}",
+                    kb([("✉️ ارسال پیام به خریدار", f"adm_order_message:{order_id}")]))
             if info["remaining"] <= LOW_STOCK:
                 await notify_admins(
                     bot, f"⚠️ موجودی «{info['name']}» رو به اتمامه: {info['remaining']} عدد باقی مانده.")
@@ -443,10 +453,10 @@ async def pay(c: CallbackQuery, bot: Bot):
             await c.answer("خطای داخلی. دوباره تلاش کن.", show_alert=True)
 
 
-async def notify_admins(bot: Bot, text: str):
+async def notify_admins(bot: Bot, text: str, markup=None):
     for a in ADMIN_IDS:
         try:
-            await bot.send_message(a, text)
+            await bot.send_message(a, text, reply_markup=markup)
         except Exception:
             pass
 
@@ -801,6 +811,8 @@ class Flow(StatesGroup):
     preview_stock = State()
     edit_value = State()
     manual = State()
+    message_user_id = State()
+    message_user_content = State()
     set_value = State()
 
 
@@ -812,9 +824,95 @@ async def admin_panel(c: CallbackQuery, state: FSMContext):
         kb([("📂 دسته‌ها و محصولات", "adm_cats")],
            [("💳 درگاه‌های پرداخت", "adm_gw")],
            [("📊 آمار", "adm_stats"), ("💰 شارژ دستی کاربر", "adm_manual")],
+           [("✉️ پیام به آیدی عددی", "adm_message_user")],
            [("⬆️ آپدیت ربات از گیت‌هاب", "adm_update")],
            [("🔙 بازگشت", "home")]))
     await c.answer()
+
+
+ADMIN_MESSAGE_CANCEL = kb([("🔙 انصراف و بازگشت به پنل ادمین", "admin")])
+
+
+@admin.callback_query(F.data.regexp(r"^adm_order_message:[0-9]{1,19}$"), F.message.chat.type == "private")
+async def admin_message_buyer(c: CallbackQuery, state: FSMContext):
+    order_id = int(c.data.split(":")[1])
+    if order_id > 2**63 - 1:
+        await c.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    order = await q1("SELECT user_id FROM orders WHERE id=?", (order_id,))
+    if not order:
+        await c.answer("سفارش پیدا نشد.", show_alert=True)
+        return
+    uid = order["user_id"]
+    await state.set_data({"recipient_id": uid})
+    await state.set_state(Flow.message_user_content)
+    await c.answer()
+    await c.message.answer(
+        f"پیام برای خریدار سفارش #{order_id} (آیدی {uid}) را بفرست. "
+        "ربات پیام بعدی را مستقیماً برای خریدار می‌فرستد.",
+        reply_markup=ADMIN_MESSAGE_CANCEL)
+
+
+@admin.callback_query(F.data == "adm_message_user", F.message.chat.type == "private")
+async def admin_message_user(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(Flow.message_user_id)
+    await edit(c, "آیدی عددی کاربری که می‌خواهی به او پیام بدهی را بفرست.",
+               ADMIN_MESSAGE_CANCEL)
+    await c.answer()
+
+
+@admin.message(Command("update"))
+async def cmd_update(m: Message, bot: Bot):
+    await m.answer("⏳ در حال بررسی آپدیت...")
+    await _manual_update_reply(bot, m.answer)
+
+
+@admin.message(Flow.message_user_id, F.chat.type == "private")
+async def admin_message_recipient(m: Message, state: FSMContext):
+    raw_id = (m.text or "").translate(_DIGITS).strip()
+    if not re.fullmatch(r"[0-9]{1,19}", raw_id) or not 0 < int(raw_id) <= 2**63 - 1:
+        await m.answer("آیدی عددی معتبر بفرست.", reply_markup=ADMIN_MESSAGE_CANCEL)
+        return
+    uid = int(raw_id)
+    user = await q1("SELECT username FROM users WHERE id=?", (uid,))
+    if user is None:
+        await m.answer("این آیدی در کاربران ربات پیدا نشد.", reply_markup=ADMIN_MESSAGE_CANCEL)
+        return
+    await state.set_data({"recipient_id": uid})
+    await state.set_state(Flow.message_user_content)
+    username = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
+    await m.answer(
+        f"پیام برای {username} (آیدی {uid}) را بفرست. ربات پیام بعدی را مستقیماً برای کاربر می‌فرستد.",
+        reply_markup=ADMIN_MESSAGE_CANCEL)
+
+
+@admin.message(Flow.message_user_content, F.chat.type == "private")
+async def admin_send_user_message(m: Message, state: FSMContext, bot: Bot):
+    if m.media_group_id or not (m.text or m.photo or m.document or m.video or m.voice):
+        await m.answer("یک پیام متنی، عکس، فایل، ویدیو یا پیام صوتی بفرست.",
+                       reply_markup=ADMIN_MESSAGE_CANCEL)
+        return
+    uid = (await state.get_data())["recipient_id"]
+    try:
+        await bot.copy_message(chat_id=uid, from_chat_id=m.chat.id, message_id=m.message_id)
+    except TelegramRetryAfter as exc:
+        await m.answer(f"تلگرام ارسال را محدود کرده. پس از {exc.retry_after} ثانیه دوباره بفرست.",
+                       reply_markup=ADMIN_MESSAGE_CANCEL)
+        return
+    except TelegramForbiddenError:
+        await state.clear()
+        await m.answer("ربات اجازه‌ی ارسال پیام به این کاربر را ندارد.",
+                       reply_markup=kb([("🔙 پنل ادمین", "admin")]))
+        return
+    except (TelegramBadRequest, TelegramNetworkError) as exc:
+        logging.warning("Could not copy admin message to user %s: %s", uid, exc)
+        await m.answer("ارسال پیام تأیید نشد. وضعیت اتصال یا نوع پیام را بررسی کن.",
+                       reply_markup=ADMIN_MESSAGE_CANCEL)
+        return
+    await state.clear()
+    await m.answer(f"✅ پیام برای آیدی {uid} ارسال شد.",
+                   reply_markup=kb([("✉️ پیام به آیدی دیگر", "adm_message_user"), ("🔙 پنل ادمین", "admin")]))
 
 
 # ── دسته‌ها ──
@@ -1498,12 +1596,6 @@ async def _manual_update_reply(bot: Bot, send):
 async def adm_update(c: CallbackQuery, bot: Bot):
     await c.answer("در حال بررسی آپدیت...")
     await _manual_update_reply(bot, c.message.answer)
-
-
-@admin.message(Command("update"))
-async def cmd_update(m: Message, bot: Bot):
-    await m.answer("⏳ در حال بررسی آپدیت...")
-    await _manual_update_reply(bot, m.answer)
 
 
 # ───────────────────────── اجرا ─────────────────────────
