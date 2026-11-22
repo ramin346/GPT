@@ -1,0 +1,14 @@
+# اطلاعات حساس و داده‌ها — هرگز وارد گیت نشوند
+.env
+*.db
+*.db-journal
+backups/
+
+# پایتون
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# سیستم
+.DS_Store
