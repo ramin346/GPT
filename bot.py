@@ -5,15 +5,16 @@ import logging
 import os
 import re
 import time
+from uuid import uuid4
 
 import aiosqlite
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
@@ -73,6 +74,17 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER,
             status TEXT, created INTEGER);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE INDEX IF NOT EXISTS idx_topups_user ON topups(user_id, id);
+        CREATE TABLE IF NOT EXISTS restock_watch(
+            product_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+            PRIMARY KEY(product_id, user_id));
+        CREATE TABLE IF NOT EXISTS restock_event(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, product_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS restock_delivery(
+            event_id INTEGER NOT NULL, user_id INTEGER NOT NULL, priority INTEGER NOT NULL,
+            PRIMARY KEY(event_id, user_id));
+        CREATE INDEX IF NOT EXISTS idx_restock_queue ON restock_delivery(event_id, priority DESC, user_id);
         """
     )
     cols = {r["name"] for r in await qa("PRAGMA table_info(topups)")}
@@ -214,6 +226,7 @@ def main_menu(uid: int):
     rows = [
         [("🛍 محصولات", "shop")],
         [("💰 کیف پول", "wallet"), ("➕ شارژ حساب", "topup")],
+        [("🧾 پیگیری شارژ", "topups:0")],
         [("📦 سفارش‌های من", "orders"), ("☎️ پشتیبانی", "support")],
     ]
     if uid in ADMIN_IDS:
@@ -255,7 +268,8 @@ async def support(c: CallbackQuery):
 async def wallet(c: CallbackQuery):
     bal = await balance_of(c.from_user.id)
     await edit(c, f"💰 موجودی شما: {fmt(bal)} {CURRENCY}",
-               kb([("➕ شارژ حساب", "topup")], [("🔙 بازگشت", "home")]))
+               kb([("➕ شارژ حساب", "topup")], [("🧾 پیگیری شارژ", "topups:0")],
+                  [("🔙 بازگشت", "home")]))
     await c.answer()
 
 
@@ -312,9 +326,34 @@ async def product_view(c: CallbackQuery):
     rows = []
     if p["qty"] > 0:
         rows.append([("✅ خرید", f"buy:{pid}")])
+    else:
+        watching = await q1("SELECT 1 FROM restock_watch WHERE product_id=? AND user_id=?",
+                            (pid, c.from_user.id))
+        text += ("\nاین محصول در اولویت اطلاع‌رسانی توست." if watching
+                 else "\nبا زدن «خبرم کن» پیام موجودشدن را زودتر دریافت می‌کنی.")
+        label = "🔕 لغو اولویت اطلاع‌رسانی" if watching else "🔔 خبرم کن"
+        action = "unwatch" if watching else "watch"
+        rows.append([(label, f"{action}:{pid}")])
     rows.append([("🔙 بازگشت", f"cat:{p['category_id']}")])
     await edit(c, text, kb(*rows))
     await c.answer()
+
+
+@router.callback_query(F.data.regexp(r"^(watch|unwatch):[0-9]+$"))
+async def restock_watch(c: CallbackQuery):
+    action, raw_pid = c.data.split(":")
+    pid, uid = int(raw_pid), c.from_user.id
+    async with aiosqlite.connect(DB_PATH) as conn:
+        if action == "watch":
+            await conn.execute(
+                "INSERT OR IGNORE INTO restock_watch(product_id,user_id) "
+                "SELECT p.id, u.id FROM products p CROSS JOIN users u "
+                "WHERE p.id=? AND u.id=? AND p.active=1 AND NOT EXISTS "
+                "(SELECT 1 FROM stock WHERE product_id=p.id AND sold=0)", (pid, uid))
+        else:
+            await conn.execute("DELETE FROM restock_watch WHERE product_id=? AND user_id=?", (pid, uid))
+        await conn.commit()
+    await product_view(c)
 
 
 @router.callback_query(F.data.startswith("buy:"))
@@ -493,6 +532,69 @@ async def choose_gateway(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
+TOPUP_STATUS = {
+    "approved": "تأیید و شارژ شد", "rejected": "رد شد", "failed": "ناموفق",
+    "expired": "منقضی شد", "refunded": "برگشت خورد",
+}
+NP_PENDING_STATUS = {
+    "waiting": "در انتظار پرداخت", "confirming": "در انتظار تأیید شبکه",
+    "confirmed": "در حال نهایی‌سازی", "sending": "در حال نهایی‌سازی",
+    "partially_paid": "پرداخت ناقص، نیازمند بررسی", "finished": "در انتظار ثبت اعتبار",
+}
+
+
+def topup_status(t) -> str:
+    if t["status"] != "pending":
+        return TOPUP_STATUS.get(t["status"], "نیازمند بررسی")
+    if t["gateway"] == "nowpayments":
+        return NP_PENDING_STATUS.get(t["np_status"], "در انتظار بررسی پرداخت")
+    return "در انتظار بررسی رسید"
+
+
+@router.callback_query(F.data.regexp(r"^topups:[0-9]+$"))
+async def topup_history(c: CallbackQuery):
+    page = int(c.data.split(":")[1])
+    rows = await qa(
+        "SELECT * FROM topups WHERE user_id=? ORDER BY id DESC LIMIT 9 OFFSET ?",
+        (c.from_user.id, page * 8))
+    buttons = [[(f"#{t['id']} · {fmt(t['amount'])} {CURRENCY} · {topup_status(t)}",
+                 f"topupinfo:{t['id']}:{page}")] for t in rows[:8]]
+    navigation = []
+    if page:
+        navigation.append(("◀️ جدیدتر", f"topups:{page - 1}"))
+    if len(rows) > 8:
+        navigation.append(("قدیمی‌تر ▶️", f"topups:{page + 1}"))
+    if navigation:
+        buttons.append(navigation)
+    buttons.append([("🔙 بازگشت به کیف پول", "wallet")])
+    await edit(c, "🧾 درخواست‌های شارژ" if rows else "در این صفحه درخواست شارژی نیست.", kb(*buttons))
+    await c.answer()
+
+
+@router.callback_query(F.data.regexp(r"^topupinfo:[0-9]+:[0-9]+$"))
+async def topup_info(c: CallbackQuery):
+    _, tid, page = c.data.split(":")
+    t = await q1("SELECT * FROM topups WHERE id=? AND user_id=?", (int(tid), c.from_user.id))
+    if not t:
+        await c.answer("درخواست شارژ پیدا نشد.", show_alert=True)
+        return
+    crypto = t["gateway"] == "nowpayments"
+    method = "تتر" if crypto else "کارت‌به‌کارت"
+    text = (f"🧾 درخواست شارژ #{t['id']}\n"
+            f"روش پرداخت: {method}\nمبلغ شارژ: {fmt(t['amount'])} {CURRENCY}\n"
+            f"وضعیت: {topup_status(t)}")
+    buttons = []
+    if crypto and t["status"] == "pending":
+        if t["pay_address"] and t["pay_amount"]:
+            text += (f"\n\nمبلغ دقیق پرداخت: {t['pay_amount']} USDT"
+                     f"\nشبکه: {NETWORKS.get(t['pay_currency'], t['pay_currency'])}"
+                     f"\nآدرس: {t['pay_address']}")
+        buttons.append([("🔄 بررسی پرداخت", f"npcheck:{t['id']}")])
+    buttons.append([("🔙 درخواست‌های شارژ", f"topups:{page}")])
+    await edit(c, text, kb(*buttons))
+    await c.answer()
+
+
 # ── کارت‌به‌کارت ──
 @router.message(TopUp.amount)
 async def topup_amount(m: Message, state: FSMContext):
@@ -527,7 +629,9 @@ async def topup_receipt(m: Message, state: FSMContext, bot: Bot):
         except Exception:
             pass
     await state.clear()
-    await m.answer("رسید ثبت شد. بعد از تأیید، حسابت شارژ می‌شود.", reply_markup=main_menu(m.from_user.id))
+    await m.answer(
+        "رسید ثبت شد. بعد از تأیید، حسابت شارژ می‌شود.",
+        reply_markup=kb([("🧾 پیگیری همین شارژ", f"topupinfo:{tid}:0")], [("🔙 بازگشت", "home")]))
 
 
 @router.message(TopUp.receipt)
@@ -694,6 +798,7 @@ class Flow(StatesGroup):
     p_cost = State()
     p_desc = State()
     add_stock = State()
+    preview_stock = State()
     edit_value = State()
     manual = State()
     set_value = State()
@@ -972,12 +1077,22 @@ async def astock_add(c: CallbackQuery, state: FSMContext):
         "• هر خط = یک عدد (یک اکانت یا یک کد)\n"
         "• اگر هر آیتم چند خط است، بین آیتم‌ها یک خط فقط با --- بگذار\n"
         "• برای تعداد زیاد می‌توانی یک فایل .txt بفرستی\n\n"
-        "می‌توانی چند پیام پشت‌سرهم بفرستی. در آخر «پایان» را بزن.",
-        kb([("✅ پایان", f"aprod:{pid}")]))
+        "بعد از ارسال، تعداد آیتم‌های جدید و تکراری را می‌بینی.",
+        kb([("🔙 انصراف", f"aprod:{pid}")]))
     await c.answer()
 
 
+async def available_stock_items(conn, pid: int, items: list[str]) -> list[str]:
+    async with conn.execute(
+        "SELECT content FROM stock WHERE product_id=? "
+        "UNION SELECT content FROM orders WHERE product_id=?", (pid, pid)
+    ) as cursor:
+        existing = {row[0] for row in await cursor.fetchall()}
+    return [item for item in dict.fromkeys(items) if item not in existing]
+
+
 @admin.message(Flow.add_stock)
+@admin.message(Flow.preview_stock)
 async def add_stock_msg(m: Message, state: FSMContext, bot: Bot):
     pid = (await state.get_data())["pid"]
     text = m.text
@@ -987,20 +1102,126 @@ async def add_stock_msg(m: Message, state: FSMContext, bot: Bot):
             return
         buf = io.BytesIO()
         await bot.download(m.document, destination=buf)
-        text = buf.getvalue().decode("utf-8", errors="ignore")
-    if not text:
-        await m.answer("متن یا فایل .txt بفرست.")
-        return
-    items = split_items(text)
+        try:
+            text = buf.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            await m.answer("فایل متنی با کدگذاری UTF-8 بفرست.")
+            return
+    items = split_items(text or "")
     if not items:
-        await m.answer("چیزی برای افزودن پیدا نشد.")
+        await m.answer("متن یا فایل .txt حاوی موجودی بفرست.")
         return
-    await db.executemany("INSERT INTO stock(product_id, content) VALUES(?,?)", [(pid, i) for i in items])
-    await db.commit()
-    total = await stock_count(pid)
-    await m.answer(f"✅ {len(items)} عدد اضافه شد. موجودی فعلی: {total}\n"
-                   "می‌توانی ادامه بدهی یا «پایان» را بزنی.",
-                   reply_markup=kb([("✅ پایان", f"aprod:{pid}")]))
+    new_items = await available_stock_items(db, pid, items)
+    token = uuid4().hex
+    await state.update_data(stock_items=new_items, stock_token=token)
+    await state.set_state(Flow.preview_stock)
+    buttons = []
+    if new_items:
+        buttons.append([("✅ ثبت موجودی", f"astock_save:{token}")])
+    buttons.append([("🔙 انصراف", f"aprod:{pid}")])
+    await m.answer(
+        f"پیش‌نمایش موجودی\n\nکل آیتم‌ها: {len(items)}\n"
+        f"جدید: {len(new_items)}\nتکراری (ثبت نمی‌شود): {len(items) - len(new_items)}\n\n"
+        "برای جایگزینی این پیش‌نمایش، متن یا فایل جدید بفرست.", reply_markup=kb(*buttons))
+
+
+async def save_stock(pid: int, items: list[str]) -> tuple[int, int, int] | None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("BEGIN IMMEDIATE")
+        async with conn.execute(
+            "SELECT p.name, p.active, (SELECT COUNT(*) FROM stock "
+            "WHERE product_id=p.id AND sold=0) FROM products p WHERE p.id=?", (pid,)
+        ) as cursor:
+            product = await cursor.fetchone()
+        if product is None:
+            return None
+        name, active, previous_qty = product
+        new_items = await available_stock_items(conn, pid, items)
+        await conn.executemany("INSERT INTO stock(product_id, content) VALUES(?,?)",
+                               [(pid, item) for item in new_items])
+        recipients = 0
+        if active and previous_qty == 0 and new_items:
+            async with conn.execute(
+                "INSERT INTO restock_event(product_id,product_name) VALUES(?,?)", (pid, name)
+            ) as event:
+                event_id = event.lastrowid
+            async with conn.execute(
+                "INSERT INTO restock_delivery(event_id,user_id,priority) "
+                "SELECT ?, u.id, CASE WHEN w.user_id IS NULL THEN 0 ELSE 1 END "
+                "FROM users u LEFT JOIN restock_watch w ON w.user_id=u.id AND w.product_id=?",
+                (event_id, pid)
+            ) as deliveries:
+                recipients = deliveries.rowcount
+            await conn.execute("DELETE FROM restock_watch WHERE product_id=?", (pid,))
+            if not recipients:
+                await conn.execute("DELETE FROM restock_event WHERE id=?", (event_id,))
+        await conn.commit()
+    return len(new_items), previous_qty + len(new_items), recipients
+
+
+@admin.callback_query(F.data.startswith("astock_save:"))
+async def astock_save(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if (await state.get_state() != Flow.preview_stock.state
+            or data.get("stock_token") != c.data.split(":")[1]):
+        await c.answer("این پیش‌نمایش منقضی شده.", show_alert=True)
+        return
+    await c.answer()
+    try:
+        result = await save_stock(data["pid"], data["stock_items"])
+    except aiosqlite.Error:
+        logging.exception("Could not save stock for product %s", data["pid"])
+        await c.message.answer("ثبت موجودی ناموفق بود. دوباره دکمه‌ی ثبت را بزن.")
+        return
+    await state.clear()
+    if result is None:
+        await edit(c, "محصول دیگر وجود ندارد.", kb([("🔙 دسته‌ها", "adm_cats")]))
+        return
+    added, total, recipients = result
+    text = f"✅ {added} آیتم ثبت شد. موجودی فعلی: {total}"
+    if added < len(data["stock_items"]):
+        text += f"\n{len(data['stock_items']) - added} آیتم که پس از پیش‌نمایش ثبت شده بود رد شد."
+    if recipients:
+        text += f"\nاعلان موجودشدن برای {recipients} کاربر در صف ارسال قرار گرفت."
+    pid = data["pid"]
+    await edit(c, text, kb([("➕ افزودن دوباره", f"astock_add:{pid}")],
+                           [("🔙 مدیریت محصول", f"aprod:{pid}")]))
+
+
+async def restock_broadcast_loop(bot: Bot):
+    while True:
+        try:
+            await send_restock_batch(bot)
+        except Exception:
+            logging.exception("Restock broadcast failed")
+        await asyncio.sleep(2)
+
+
+async def send_restock_batch(bot: Bot):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async with conn.execute(
+            "SELECT d.event_id,d.user_id,e.product_id,e.product_name "
+            "FROM restock_delivery d JOIN restock_event e ON e.id=d.event_id "
+            "ORDER BY d.event_id,d.priority DESC,d.user_id LIMIT 50"
+        ) as cursor:
+            deliveries = await cursor.fetchall()
+        for event_id, uid, pid, name in deliveries:
+            try:
+                await bot.send_message(
+                    uid, f"🔔 «{name}» دوباره موجود شد.",
+                    reply_markup=kb([("🛍 مشاهده محصول", f"prod:{pid}")]))
+            except TelegramRetryAfter as exc:
+                await asyncio.sleep(exc.retry_after)
+                return
+            except (TelegramForbiddenError, TelegramBadRequest) as exc:
+                logging.info("Restock delivery skipped for user %s: %s", uid, exc)
+            await conn.execute("DELETE FROM restock_delivery WHERE event_id=? AND user_id=?",
+                               (event_id, uid))
+            await conn.execute(
+                "DELETE FROM restock_event WHERE id=? AND NOT EXISTS "
+                "(SELECT 1 FROM restock_delivery WHERE event_id=?)", (event_id, event_id))
+            await conn.commit()
+            await asyncio.sleep(0.08)
 
 
 @admin.callback_query(F.data.startswith("astock_clear:"))
@@ -1289,12 +1510,17 @@ async def cmd_update(m: Message, bot: Bot):
 async def main():
     await init_db()
     bot = Bot(BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(admin)
     dp.include_router(router)
     bg = asyncio.create_task(auto_update_loop(bot))  # noqa: F841
     bg2 = asyncio.create_task(np_poll_loop(bot))  # noqa: F841
-    await dp.start_polling(bot)
+    restock_task = asyncio.create_task(restock_broadcast_loop(bot))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        restock_task.cancel()
+        await asyncio.gather(restock_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
