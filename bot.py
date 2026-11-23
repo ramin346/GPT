@@ -229,14 +229,18 @@ def split_items(text: str) -> list[str]:
 
 def main_menu(uid: int):
     rows = [
-        [("🛍 محصولات", "shop")],
         [("💰 کیف پول", "wallet"), ("➕ شارژ حساب", "topup")],
         [("🧾 پیگیری شارژ", "topups:0")],
         [("📦 سفارش‌های من", "orders"), ("☎️ پشتیبانی", "support")],
     ]
     if uid in ADMIN_IDS:
         rows.append([("⚙️ پنل ادمین", "admin")])
-    return kb(*rows)
+    markup = kb(*rows)
+    markup.inline_keyboard.insert(0, [
+        InlineKeyboardButton(text="محصولات", callback_data="shop",
+                             icon_custom_emoji_id="5938272154826052187"),
+    ])
+    return markup
 
 
 BACK_HOME = kb([("🔙 بازگشت", "home")])
