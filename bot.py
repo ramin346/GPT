@@ -227,20 +227,35 @@ def split_items(text: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def main_menu(uid: int):
-    rows = [
-        [("💰 کیف پول", "wallet"), ("➕ شارژ حساب", "topup")],
-        [("🧾 پیگیری شارژ", "topups:0")],
-        [("📦 سفارش‌های من", "orders"), ("☎️ پشتیبانی", "support")],
-    ]
+MAIN_MENU_ROWS = (
+    (("🛍", "محصولات", "shop"),),
+    (("💰", "کیف پول", "wallet"), ("➕", "شارژ حساب", "topup")),
+    (("🧾", "پیگیری شارژ", "topups:0"),),
+    (("📦", "سفارش‌های من", "orders"), ("☎️", "پشتیبانی", "support")),
+)
+ADMIN_MENU_BUTTON = ("⚙️", "پنل ادمین", "admin")
+MENU_BUTTON_NAMES = {
+    action: label for row in (*MAIN_MENU_ROWS, (ADMIN_MENU_BUTTON,)) for _, label, action in row
+}
+DEFAULT_MENU_EMOJIS = {"shop": "5938272154826052187"}
+
+
+async def main_menu(uid: int):
+    rows = MAIN_MENU_ROWS
     if uid in ADMIN_IDS:
-        rows.append([("⚙️ پنل ادمین", "admin")])
-    markup = kb(*rows)
-    markup.inline_keyboard.insert(0, [
-        InlineKeyboardButton(text="محصولات", callback_data="shop",
-                             icon_custom_emoji_id="5938272154826052187"),
-    ])
-    return markup
+        rows = (*rows, (ADMIN_MENU_BUTTON,))
+    settings = await qa("SELECT key,value FROM settings WHERE key GLOB 'menu_emoji:*'")
+    emojis = {**DEFAULT_MENU_EMOJIS, **{r["key"].split(":", 1)[1]: r["value"] for r in settings}}
+    builder = InlineKeyboardBuilder()
+    for row in rows:
+        builder.row(*(menu_button(icon, label, action, emojis.get(action)) for icon, label, action in row))
+    return builder.as_markup()
+
+
+def menu_button(icon: str, label: str, action: str, emoji_id: str | None):
+    if emoji_id:
+        return InlineKeyboardButton(text=label, callback_data=action, icon_custom_emoji_id=emoji_id)
+    return InlineKeyboardButton(text=f"{icon} {label}", callback_data=action)
 
 
 BACK_HOME = kb([("🔙 بازگشت", "home")])
@@ -252,13 +267,13 @@ async def start(m: Message, state: FSMContext):
     await state.clear()
     await ensure_user(m.from_user.id, m.from_user.username)
     await m.answer("سلام 👋\nبه فروشگاه خوش اومدی. یکی از گزینه‌ها رو انتخاب کن:",
-                   reply_markup=main_menu(m.from_user.id))
+                   reply_markup=await main_menu(m.from_user.id))
 
 
 @router.callback_query(F.data == "home")
 async def home(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await edit(c, "منوی اصلی:", main_menu(c.from_user.id))
+    await edit(c, "منوی اصلی:", await main_menu(c.from_user.id))
     await c.answer()
 
 
@@ -684,7 +699,7 @@ async def topup_usdt(m: Message, state: FSMContext, bot: Bot):
         return
     if "np" not in await gateways_enabled() or rate <= 0:
         await state.clear()
-        await m.answer("این درگاه فعلاً فعال نیست.", reply_markup=main_menu(m.from_user.id))
+        await m.answer("این درگاه فعلاً فعال نیست.", reply_markup=await main_menu(m.from_user.id))
         return
     coin = await get_setting("np_coin", "usdttrc20")
     await m.answer("⏳ در حال ساخت آدرس پرداخت...")
@@ -823,6 +838,7 @@ class Flow(StatesGroup):
     message_user_id = State()
     message_user_content = State()
     set_value = State()
+    menu_emoji = State()
 
 
 @admin.callback_query(F.data == "admin")
@@ -834,7 +850,7 @@ async def admin_panel(c: CallbackQuery, state: FSMContext):
            [("💳 درگاه‌های پرداخت", "adm_gw")],
            [("📊 آمار", "adm_stats"), ("💰 شارژ دستی کاربر", "adm_manual")],
            [("✉️ پیام به آیدی عددی", "adm_message_user")],
-           [("💾 دریافت بکاپ", "adm_backup")],
+           [("💾 دریافت بکاپ", "adm_backup"), ("🎨 ایموجی دکمه‌ها", "adm_menu_emoji")],
            [("⬆️ آپدیت ربات از گیت‌هاب", "adm_update")],
            [("🔙 بازگشت", "home")]))
     await c.answer()
@@ -876,6 +892,76 @@ async def admin_message_user(c: CallbackQuery, state: FSMContext):
 async def cmd_update(m: Message, bot: Bot):
     await m.answer("⏳ در حال بررسی آپدیت...")
     await _manual_update_reply(bot, m.answer)
+
+
+MENU_EMOJI_BACK = kb([("🔙 انتخاب دکمه", "adm_menu_emoji")])
+
+
+@admin.callback_query(F.data == "adm_menu_emoji", F.message.chat.type == "private")
+async def admin_menu_emoji(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    buttons = [[(label, f"adm_menu_icon:{action}")] for action, label in MENU_BUTTON_NAMES.items()]
+    await edit(c, "ایموجی کدام دکمهٔ منوی اصلی را می‌خواهی عوض کنی؟",
+               kb(*buttons, [("🔙 پنل ادمین", "admin")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("adm_menu_icon:"), F.message.chat.type == "private")
+async def admin_menu_emoji_select(c: CallbackQuery, state: FSMContext):
+    action = c.data.split(":", 1)[1]
+    if action not in MENU_BUTTON_NAMES:
+        await c.answer("دکمه پیدا نشد.", show_alert=True)
+        return
+    await state.set_data({"menu_action": action})
+    await state.set_state(Flow.menu_emoji)
+    current = await get_setting(f"menu_emoji:{action}", DEFAULT_MENU_EMOJIS.get(action, ""))
+    await edit(c, f"دکمهٔ «{MENU_BUTTON_NAMES[action]}»\n"
+                  f"شناسهٔ فعلی: {current or 'ایموجی معمولی'}\n\n"
+                  "شناسه را با براکت یا بدون براکت بفرست. خود ایموجی سفارشی را هم می‌توانی بفرستی. "
+                  "برای برگشت به ایموجی معمولی، «-» بفرست.", MENU_EMOJI_BACK)
+    await c.answer()
+
+
+def read_menu_emoji_id(m: Message) -> str | None:
+    text = (m.text or "").strip().translate(_DIGITS)
+    if text == "-":
+        return ""
+    ids = {entity.custom_emoji_id for entity in (m.entities or [])
+           if entity.type == "custom_emoji" and entity.custom_emoji_id}
+    if len(ids) == 1:
+        return ids.pop()
+    if text and text[0] + text[-1] in ("[]", "()", "{}", "<>"):
+        text = text[1:-1].strip()
+    return text if re.fullmatch(r"[1-9][0-9]{0,19}", text) else None
+
+
+@admin.message(Flow.menu_emoji, F.chat.type == "private")
+async def admin_menu_emoji_save(m: Message, state: FSMContext, bot: Bot):
+    emoji_id = read_menu_emoji_id(m)
+    if emoji_id is None:
+        await m.answer("یک ایموجی سفارشی یا شناسهٔ عددی بفرست.", reply_markup=MENU_EMOJI_BACK)
+        return
+    action = (await state.get_data())["menu_action"]
+    if emoji_id:
+        label = MENU_BUTTON_NAMES[action]
+        preview = InlineKeyboardBuilder()
+        preview.row(menu_button("", label, "noop", emoji_id))
+        try:
+            stickers = await bot.get_custom_emoji_stickers(custom_emoji_ids=[emoji_id])
+            if not stickers:
+                await m.answer("تلگرام این شناسه را پیدا نکرد. دوباره بررسی کن.", reply_markup=MENU_EMOJI_BACK)
+                return
+            await m.answer("پیش‌نمایش دکمه", reply_markup=preview.as_markup())
+        except TelegramBadRequest:
+            await m.answer("تلگرام این ایموجی را برای دکمه قبول نکرد. شناسه یا دسترسی ربات را بررسی کن.",
+                           reply_markup=MENU_EMOJI_BACK)
+            return
+        except (TelegramNetworkError, TelegramRetryAfter):
+            await m.answer("بررسی ایموجی انجام نشد. کمی بعد دوباره بفرست.", reply_markup=MENU_EMOJI_BACK)
+            return
+    await set_setting(f"menu_emoji:{action}", emoji_id)
+    await state.clear()
+    await m.answer("✅ تنظیم ذخیره شد. برای دیدن منوی تازه /start بزن.", reply_markup=MENU_EMOJI_BACK)
 
 
 @admin.message(Flow.message_user_id, F.chat.type == "private")
@@ -1385,7 +1471,7 @@ async def adm_manual_do(m: Message, state: FSMContext):
     await credit(uid, amount)
     await state.clear()
     await m.answer(f"✅ انجام شد. موجودی جدید: {fmt(await balance_of(uid))}",
-                   reply_markup=main_menu(m.from_user.id))
+                   reply_markup=await main_menu(m.from_user.id))
 
 
 @admin.callback_query(F.data.startswith(("ta:", "tr:")))
