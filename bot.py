@@ -1,10 +1,16 @@
+import argparse
 import asyncio
 import html
 import io
 import logging
 import os
 import re
+import sqlite3
+import tempfile
 import time
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 import aiosqlite
@@ -15,7 +21,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
-from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
 
@@ -26,7 +32,6 @@ import updater  # noqa: E402
 logging.basicConfig(level=logging.INFO)
 
 # ───────────────────────── تنظیمات ─────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()}
 CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000-0000-0000-0000")
 CARD_OWNER = os.environ.get("CARD_OWNER", "نام صاحب کارت")
@@ -825,6 +830,7 @@ async def admin_panel(c: CallbackQuery, state: FSMContext):
            [("💳 درگاه‌های پرداخت", "adm_gw")],
            [("📊 آمار", "adm_stats"), ("💰 شارژ دستی کاربر", "adm_manual")],
            [("✉️ پیام به آیدی عددی", "adm_message_user")],
+           [("💾 دریافت بکاپ", "adm_backup")],
            [("⬆️ آپدیت ربات از گیت‌هاب", "adm_update")],
            [("🔙 بازگشت", "home")]))
     await c.answer()
@@ -1598,22 +1604,126 @@ async def adm_update(c: CallbackQuery, bot: Bot):
     await _manual_update_reply(bot, c.message.answer)
 
 
+# ── بکاپ و بازیابی ──
+BACKUP_INTERVAL = 12 * 60 * 60
+backup_lock = asyncio.Lock()
+
+
+def copy_database(source: Path, destination: Path, *, validate: bool = False):
+    if destination.exists() and source.samefile(destination):
+        raise ValueError("فایل مبدا و مقصد یکی است.")
+    with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as source_conn:
+        if validate:
+            check = source_conn.execute("PRAGMA quick_check").fetchall()
+            tables = {row[0] for row in source_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            required = {"users", "categories", "products", "stock", "orders", "topups", "settings"}
+            if check != [("ok",)] or not required.issubset(tables):
+                raise ValueError("فایل بکاپ سالم نیست یا به ربات فروشگاه تعلق ندارد.")
+        if not destination.exists():
+            fd = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd)
+        with closing(sqlite3.connect(destination)) as target_conn:
+            source_conn.backup(target_conn)
+
+
+async def send_database_backup(bot: Bot, admin_ids, *, automatic: bool):
+    async with backup_lock:
+        with tempfile.TemporaryDirectory(prefix="shopbot-backup-") as directory:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
+            backup = Path(directory) / f"shopbot_{stamp}.db"
+            await asyncio.to_thread(copy_database, Path(DB_PATH), backup)
+            for uid in admin_ids:
+                try:
+                    await bot.send_document(
+                        uid, FSInputFile(backup),
+                        caption="💾 بکاپ دیتابیس فروشگاه\n"
+                                "این فایل شامل داده‌های مشتریان، سفارش‌ها و تنظیمات درگاه است. محرمانه نگهش دار.\n"
+                                "برای بازیابی، ربات را متوقف کن و در پوشهٔ پروژه دستور زیر را اجرا کن:\n"
+                                f'./venv/bin/python bot.py --restore "{backup.name}"')
+                except Exception:
+                    if not automatic:
+                        raise
+                    logging.exception("Could not send scheduled backup to admin %s", uid)
+                    continue
+                if automatic:
+                    async with aiosqlite.connect(DB_PATH) as conn:
+                        await conn.execute(
+                            "INSERT INTO settings(key,value) VALUES(?,?) "
+                            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                            (f"backup_sent:{uid}", str(int(time.time()))))
+                        await conn.commit()
+
+
+@admin.callback_query(F.data == "adm_backup", F.message.chat.type == "private")
+async def admin_backup(c: CallbackQuery, bot: Bot):
+    await c.answer("در حال آماده‌سازی بکاپ…")
+    try:
+        await send_database_backup(bot, [c.from_user.id], automatic=False)
+    except Exception:
+        logging.exception("Manual backup failed")
+        await c.message.answer("تهیه یا ارسال بکاپ ناموفق بود. دوباره امتحان کن.")
+
+
+async def automatic_backup_loop(bot: Bot):
+    while True:
+        try:
+            cutoff = int(time.time()) - BACKUP_INTERVAL
+            rows = await qa("SELECT key FROM settings WHERE key LIKE 'backup_sent:%' "
+                            "AND CAST(value AS INTEGER)>?", (cutoff,))
+            recently_sent = {row["key"] for row in rows}
+            due = sorted(uid for uid in ADMIN_IDS if f"backup_sent:{uid}" not in recently_sent)
+            if due:
+                await send_database_backup(bot, due, automatic=True)
+        except Exception:
+            logging.exception("Scheduled backup failed")
+        await asyncio.sleep(60)
+
+
+def restore_database(backup: Path):
+    db_path = Path(DB_PATH)
+    if db_path.exists() and backup.samefile(db_path):
+        raise ValueError("فایل مبدا و مقصد یکی است.")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="shopbot-restore-") as directory:
+        checked = Path(directory) / "checked.db"
+        copy_database(backup, checked, validate=True)
+        if db_path.exists():
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f_UTC")
+            previous = db_path.with_name(f"{db_path.name}.before-restore-{stamp}.db")
+            copy_database(db_path, previous)
+            print(f"بکاپ دیتابیس قبلی: {previous}")
+        copy_database(checked, db_path)
+    print(f"دیتابیس بازیابی شد: {db_path}")
+
+
 # ───────────────────────── اجرا ─────────────────────────
 async def main():
     await init_db()
-    bot = Bot(BOT_TOKEN)
+    bot = Bot(os.environ["BOT_TOKEN"])
     dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(admin)
     dp.include_router(router)
     bg = asyncio.create_task(auto_update_loop(bot))  # noqa: F841
     bg2 = asyncio.create_task(np_poll_loop(bot))  # noqa: F841
     restock_task = asyncio.create_task(restock_broadcast_loop(bot))
+    backup_task = asyncio.create_task(automatic_backup_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
         restock_task.cancel()
-        await asyncio.gather(restock_task, return_exceptions=True)
+        backup_task.cancel()
+        await asyncio.gather(restock_task, backup_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--restore", type=Path, metavar="BACKUP")
+    args = parser.parse_args()
+    if args.restore:
+        try:
+            restore_database(args.restore)
+        except (OSError, ValueError, sqlite3.Error) as exc:
+            parser.exit(1, f"بازیابی ناموفق: {exc}\n")
+    else:
+        asyncio.run(main())
